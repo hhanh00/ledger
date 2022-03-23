@@ -1,9 +1,12 @@
 use ledger::{LedgerApp, ApduCommand};
 use bip39::{Mnemonic, Language, Seed};
+use blake2::{Blake2b512, Blake2bMac512};
+use byteorder::{ByteOrder, LittleEndian};
 use ed25519_bip32::{DerivationScheme, XPrv};
 use sha2::{Sha256, Sha512};
 use hmac::{Hmac, Mac};
 use hmac::digest::{crypto_common, FixedOutput, MacMarker, Update};
+use jubjub::Fr;
 use zcash_primitives::zip32::{ExtendedSpendingKey, ChildIndex, ExtendedFullViewingKey};
 use zcash_client_backend::encoding::encode_payment_address;
 use zcash_primitives::consensus::Network::MainNetwork;
@@ -70,14 +73,81 @@ fn get_addr(app: &LedgerApp) -> anyhow::Result<String> {
 // }
 
 const CURVE_SEEDKEY: &[u8] = b"ed25519 seed";
+const ZCASH_PERSO: &[u8] = b"Zcash_ExpandSeed";
+
 type HMAC256 = Hmac<Sha256>;
 type HMAC512 = Hmac<Sha512>;
+type Blake2 = Blake2bMac512;
 
 fn hmac_sha2<T: Update + FixedOutput + MacMarker + crypto_common::KeyInit>(data: &mut [u8]) {
     let mut hmac = T::new_from_slice(CURVE_SEEDKEY).unwrap();
     hmac.update(&data);
     data.copy_from_slice(&hmac.finalize().into_bytes());
 }
+
+macro_rules! prf_expand {
+    ($key:expr, $($y:expr),+) => (
+    {
+        let mut res = [0u8; 64];
+        let mut hasher = Blake2bMac512
+        ::new_from_slice(ZCASH_PERSO).unwrap();
+        Mac::update(&mut hasher, $key);
+        $(
+            Mac::update(&mut hasher, $y);
+        )+
+        res.copy_from_slice(&hasher.finalize().into_bytes());
+        res
+    })
+}
+
+struct ExtSpendingKey {
+    key: [u8; 32],
+    chain: [u8; 32],
+    ovk: [u8; 32],
+    dk: [u8; 32],
+    ask: Fr,
+    nsk: Fr,
+}
+
+fn derive_child(esk: &mut ExtSpendingKey, path: &[u32]) {
+    let hasher = Blake2::new_from_slice(ZCASH_PERSO).unwrap();
+    for &p in path {
+        let hardened = (p & 0x8000_0000) != 0;
+        let c = p & 0x7FFF_FFFF;
+        assert!(hardened);
+        //make index LE
+        //zip32 child derivation
+
+        let a = prf_expand!(&esk.key, &[0x00]);
+        let n = prf_expand!(&esk.key, &[0x01]);
+        let mut le_i = [0; 4];
+        LittleEndian::write_u32(&mut le_i, c + (1 << 31));
+        let h = prf_expand!(&esk.chain, &[0x11], &a, &n, &esk.ovk, &esk.dk, &le_i);
+        esk.key.copy_from_slice(&h[..32]);
+        esk.chain.copy_from_slice(&h[32..]);
+        let ask_cur = Fr::from_bytes_wide(&prf_expand!(&esk.key, &[0x13]));
+        let nsk_cur = Fr::from_bytes_wide(&prf_expand!(&esk.key, &[0x14]));
+        esk.ask += ask_cur;
+        esk.nsk += nsk_cur;
+
+
+/*        let tmp = bolos::blake2b_expand_vec_four(&chain, &[0x11], &expkey, &divkey, &le_i);
+        //extract key and chainkey
+        key.copy_from_slice(&tmp[..32]);
+        chain.copy_from_slice(&tmp[32..]);
+
+        let ask_cur = Fr::from_bytes_wide(&prf_expand(&key, &[0x13]));
+        let nsk_cur = Fr::from_bytes_wide(&prf_expand(&key, &[0x14]));
+
+        ask += ask_cur;
+        nsk += nsk_cur;
+
+        //new divkey from old divkey and key
+        update_dk_zip32(&key, &mut divkey);
+        update_exk_zip32(&key, &mut expkey);
+*/    }
+}
+
 
 fn main() -> anyhow::Result<()> {
     dotenv::dotenv().unwrap();

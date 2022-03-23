@@ -19,13 +19,15 @@ slip10 = "0.4.3"
 ed25519-bip32 = "0.4.1"
 hmac = "0.12.1"
 sha2 = "0.10.2"
-#jubjub = "^0.6"
+jubjub = "^0.8.0"
+blake2 = "0.10.4"
+byteorder = "1.4.3"
 
 [dependencies.zcash_primitives]
-path = "/home/hanh/projects/librustzcash/zcash_primitives"
+path = "../librustzcash/zcash_primitives"
 
 [dependencies.zcash_client_backend]
-path = "/home/hanh/projects/librustzcash/zcash_client_backend"
+path = "../librustzcash/zcash_client_backend"
 
 [patch.crates-io]
 incrementalmerkletree = { git = "https://github.com/zcash/incrementalmerkletree.git", rev = "dd57b430dee7c0b163f4035fef2280cd1935036c" }
