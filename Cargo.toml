@@ -7,7 +7,8 @@ edition = "2018"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-ledger = "0.2.5"
+ledger-apdu = "0.8.0"
+#ledger-transport-zemu = "0.7.0"
 anyhow = "1.0.42"
 hex = "0.4.3"
 secp256k1 = "0.20.2"
@@ -20,8 +21,12 @@ ed25519-bip32 = "0.4.1"
 hmac = "0.12.1"
 sha2 = "0.10.2"
 jubjub = "^0.8.0"
-blake2 = "0.10.4"
+blake2b_simd = "1.0.0"
 byteorder = "1.4.3"
+reqwest = { version = "0.11.10", features = ["json"] }
+serde = "1.0.136"
+serde_json = "1.0.79"
+tokio = { version = "1.17.0", features = ["macros"] }
 
 [dependencies.zcash_primitives]
 path = "../librustzcash/zcash_primitives"

@@ -1,48 +1,43 @@
-use ledger::{LedgerApp, ApduCommand};
+#![allow(unused_imports)]
+
 use bip39::{Mnemonic, Language, Seed};
-use blake2::{Blake2b512, Blake2bMac512};
-use byteorder::{ByteOrder, LittleEndian};
+use byteorder::{ByteOrder, LE, LittleEndian, WriteBytesExt};
 use ed25519_bip32::{DerivationScheme, XPrv};
 use sha2::{Sha256, Sha512};
 use hmac::{Hmac, Mac};
 use hmac::digest::{crypto_common, FixedOutput, MacMarker, Update};
+use blake2b_simd::Params;
 use jubjub::Fr;
-use zcash_primitives::zip32::{ExtendedSpendingKey, ChildIndex, ExtendedFullViewingKey};
-use zcash_client_backend::encoding::encode_payment_address;
+use ledger_apdu::{APDUAnswer, APDUCommand};
+use zcash_primitives::zip32::{ExtendedSpendingKey, ChildIndex, ExtendedFullViewingKey, ChainCode, DiversifierKey, FvkFingerprint};
+use zcash_client_backend::encoding::{decode_extended_full_viewing_key, decode_payment_address, encode_extended_spending_key, encode_payment_address};
 use zcash_primitives::consensus::Network::MainNetwork;
-use zcash_primitives::consensus::Parameters;
-use zcash_primitives::sapling::keys::FullViewingKey;
+use zcash_primitives::consensus::{Network, Parameters};
+use zcash_primitives::constants::{PROOF_GENERATION_KEY_GENERATOR, SPENDING_KEY_GENERATOR};
+use zcash_primitives::keys::OutgoingViewingKey;
+use zcash_primitives::sapling::keys::{ExpandedSpendingKey, FullViewingKey};
+use zcash_primitives::sapling::ViewingKey;
+use serde::{Serialize, Deserialize};
+use serde::__private::de::Content::ByteBuf;
+use zcash_primitives::transaction::components::amount::DEFAULT_FEE;
+use crate::tx::Tx;
 
-#[allow(dead_code)]
-fn info(app: &LedgerApp) -> anyhow::Result<()> {
-    let command = ApduCommand {
-        cla: 0x85,
-        ins: 0x00,
-        p1: 0,
-        p2: 0,
-        length: 0,
-        data: vec![]
-    };
-    let res = app.exchange(command)?;
-    println!("{}", hex::encode(res.data));
+// mod ledger;
+mod tx;
 
-    Ok(())
+const HARDENED: u32 = 0x8000_0000;
+const NETWORK: &Network = &MainNetwork;
+
+#[derive(Serialize, Deserialize)]
+#[allow(non_snake_case)]
+struct APDURequest {
+    apduHex: String,
 }
 
-fn get_addr(app: &LedgerApp) -> anyhow::Result<String> {
-    let command = ApduCommand {
-        cla: 0x85,
-        ins: 0x11,
-        p1: 0,
-        p2: 0,
-        length: 4,
-        data: vec![0, 0, 0, 0]
-    };
-    let res = app.exchange(command)?;
-    let address = String::from_utf8(res.data[43..].to_ascii_lowercase())?;
-    println!("{}", address);
-
-    Ok(address)
+#[derive(Serialize, Deserialize)]
+struct APDUReply {
+    data: String,
+    error: Option<String>,
 }
 
 // fn get_ivk(app: &LedgerApp) -> anyhow::Result<String> {
@@ -77,7 +72,6 @@ const ZCASH_PERSO: &[u8] = b"Zcash_ExpandSeed";
 
 type HMAC256 = Hmac<Sha256>;
 type HMAC512 = Hmac<Sha512>;
-type Blake2 = Blake2bMac512;
 
 fn hmac_sha2<T: Update + FixedOutput + MacMarker + crypto_common::KeyInit>(data: &mut [u8]) {
     let mut hmac = T::new_from_slice(CURVE_SEEDKEY).unwrap();
@@ -86,22 +80,22 @@ fn hmac_sha2<T: Update + FixedOutput + MacMarker + crypto_common::KeyInit>(data:
 }
 
 macro_rules! prf_expand {
-    ($key:expr, $($y:expr),+) => (
+    ($($y:expr),*) => (
     {
         let mut res = [0u8; 64];
-        let mut hasher = Blake2bMac512
-        ::new_from_slice(ZCASH_PERSO).unwrap();
-        Mac::update(&mut hasher, $key);
+        let mut hasher = Params::new()
+            .hash_length(64)
+            .personal(ZCASH_PERSO)
+            .to_state();
         $(
-            Mac::update(&mut hasher, $y);
-        )+
-        res.copy_from_slice(&hasher.finalize().into_bytes());
+            hasher.update($y);
+        )*
+        res.copy_from_slice(&hasher.finalize().as_bytes());
         res
     })
 }
 
 struct ExtSpendingKey {
-    key: [u8; 32],
     chain: [u8; 32],
     ovk: [u8; 32],
     dk: [u8; 32],
@@ -110,50 +104,56 @@ struct ExtSpendingKey {
 }
 
 fn derive_child(esk: &mut ExtSpendingKey, path: &[u32]) {
-    let hasher = Blake2::new_from_slice(ZCASH_PERSO).unwrap();
+    let mut a = [0u8; 32];
+    let mut n = [0u8; 32];
+    a.copy_from_slice(&esk.ask.to_bytes());
+    n.copy_from_slice(&esk.nsk.to_bytes());
+
     for &p in path {
+        println!("==> ask: {}", hex::encode(esk.ask.to_bytes()));
         let hardened = (p & 0x8000_0000) != 0;
         let c = p & 0x7FFF_FFFF;
         assert!(hardened);
         //make index LE
         //zip32 child derivation
-
-        let a = prf_expand!(&esk.key, &[0x00]);
-        let n = prf_expand!(&esk.key, &[0x01]);
         let mut le_i = [0; 4];
         LittleEndian::write_u32(&mut le_i, c + (1 << 31));
+        println!("==> chain: {}", hex::encode(esk.chain));
+        println!("==> a: {}", hex::encode(a));
+        println!("==> n: {}", hex::encode(n));
+        println!("==> ovk: {}", hex::encode(esk.ovk));
+        println!("==> dk: {}", hex::encode(esk.dk));
+        println!("==> i: {}", hex::encode(le_i));
         let h = prf_expand!(&esk.chain, &[0x11], &a, &n, &esk.ovk, &esk.dk, &le_i);
-        esk.key.copy_from_slice(&h[..32]);
+        println!("==> tmp: {}", hex::encode(h));
+        let mut key = [0u8; 32];
+        key.copy_from_slice(&h[..32]);
         esk.chain.copy_from_slice(&h[32..]);
-        let ask_cur = Fr::from_bytes_wide(&prf_expand!(&esk.key, &[0x13]));
-        let nsk_cur = Fr::from_bytes_wide(&prf_expand!(&esk.key, &[0x14]));
+        let ask_cur = Fr::from_bytes_wide(&prf_expand!(&key, &[0x13]));
+        let nsk_cur = Fr::from_bytes_wide(&prf_expand!(&key, &[0x14]));
         esk.ask += ask_cur;
         esk.nsk += nsk_cur;
 
+        let t = prf_expand!(&key, &[0x15], &esk.ovk);
+        esk.ovk.copy_from_slice(&t[..32]);
+        let t = prf_expand!(&key, &[0x16], &esk.dk);
+        esk.dk.copy_from_slice(&t[..32]);
 
-/*        let tmp = bolos::blake2b_expand_vec_four(&chain, &[0x11], &expkey, &divkey, &le_i);
-        //extract key and chainkey
-        key.copy_from_slice(&tmp[..32]);
-        chain.copy_from_slice(&tmp[32..]);
-
-        let ask_cur = Fr::from_bytes_wide(&prf_expand(&key, &[0x13]));
-        let nsk_cur = Fr::from_bytes_wide(&prf_expand(&key, &[0x14]));
-
-        ask += ask_cur;
-        nsk += nsk_cur;
-
-        //new divkey from old divkey and key
-        update_dk_zip32(&key, &mut divkey);
-        update_exk_zip32(&key, &mut expkey);
-*/    }
+        a.copy_from_slice(&scalar_to_bytes(&prf_expand!(&key, &[0x00])));
+        n.copy_from_slice(&scalar_to_bytes(&prf_expand!(&key, &[0x01])));
+    }
 }
 
+fn scalar_to_bytes(k: &[u8; 64]) -> [u8; 32] {
+    let t = Fr::from_bytes_wide(k);
+    t.to_bytes()
+}
 
 fn main() -> anyhow::Result<()> {
     dotenv::dotenv().unwrap();
 
-    let ledger = LedgerApp::new().unwrap();
-    info(&ledger).unwrap();
+    // let ledger = LedgerApp::new().unwrap();
+    // info(&ledger).unwrap();
 
     // Convert mnemonic phrase to seed (BIP-39)
     let seed = dotenv::var("SEED").unwrap();
@@ -204,22 +204,221 @@ fn main() -> anyhow::Result<()> {
     seed.copy_from_slice(&priv_key.extended_secret_key()[0..32]);
 
     let master = ExtendedSpendingKey::master(&seed);
-    let path = [
-        ChildIndex::Hardened(32),
-        ChildIndex::Hardened(133),
-        ChildIndex::Hardened(1000),
-    ];
-    let sk = ExtendedSpendingKey::from_path(&master, &path);
+    let mut espk = ExtSpendingKey {
+        chain: master.chain_code.0,
+        ovk: master.expsk.ovk.0,
+        dk: master.dk.0,
+        ask: master.expsk.ask,
+        nsk: master.expsk.nsk,
+    };
 
-    // let fvk = ExtendedFullViewingKey::from(&sk);
-    // let ivk = fvk.fvk.vk.ivk().0.to_bytes();
-    // println!("ivk: {}", hex::encode(&ivk));
-    // let nsk = sk.expsk.nsk;
-    // println!("nsk: {}", hex::encode(nsk.to_bytes()));
+    derive_child(&mut espk, &[HARDENED | 32, HARDENED | 133, HARDENED | 0]);
+    let ak = SPENDING_KEY_GENERATOR * espk.ask;
+    let nk = PROOF_GENERATION_KEY_GENERATOR * espk.nsk;
+    let vk = ViewingKey {
+        ak,
+        nk,
+    };
+    let fvk = FullViewingKey {
+        vk,
+        ovk: OutgoingViewingKey(espk.ovk),
+    };
+    let tag = FvkFingerprint::from(&fvk).tag();
+
+    let esk = ExpandedSpendingKey {
+        ask: espk.ask,
+        nsk: espk.nsk,
+        ovk: OutgoingViewingKey(espk.ovk),
+    };
+
+    let sk = ExtendedSpendingKey {
+        depth: 0,
+        parent_fvk_tag: tag,
+        child_index: ChildIndex::Hardened(0),
+        chain_code: ChainCode(espk.chain),
+        expsk: esk,
+        dk: DiversifierKey(espk.dk),
+    };
+
+    // let path = [
+    //     ChildIndex::Hardened(32),
+    //     ChildIndex::Hardened(133),
+    //     ChildIndex::Hardened(1000),
+    // ];
+    // let sk = ExtendedSpendingKey::from_path(&master, &path);
+
+    let fvk = ExtendedFullViewingKey::from(&sk);
+    let ivk = fvk.fvk.vk.ivk().0.to_bytes();
+    println!("ivk: {}", hex::encode(&ivk));
+    let nsk = sk.expsk.nsk;
+    println!("nsk: {}", hex::encode(nsk.to_bytes()));
     let (_, pa) = sk.default_address();
-    let address = encode_payment_address(MainNetwork.hrp_sapling_payment_address(), &pa);
+    let address = encode_payment_address(NETWORK.hrp_sapling_payment_address(), &pa);
     println!("{}", address);
 
+    let sk = encode_extended_spending_key(NETWORK.hrp_sapling_extended_spending_key(), &sk);
+    println!("{}", sk);
+
+
     Ok(())
+}
+
+async fn make_tx_init_data(tx: &Tx) {
+    let mut buffer = Vec::<u8>::new();
+    let tin_count = tx.t_inputs.len();
+    let s_in_count = tx.inputs.len();
+    let s_out_count = tx.outputs.len();
+    // TODO: Support t in/outputs
+    assert_eq!(tin_count, 0);
+    buffer.push(0u8);
+    buffer.push(0u8);
+    // buffer.push(0u8);
+    // buffer.push(0u8);
+    buffer.push(s_in_count as u8);
+    buffer.push((s_out_count + 1) as u8); // +1 for change
+
+    let mut change = 0;
+    for sin in tx.inputs.iter() {
+        buffer.write_u32::<LE>(0).unwrap();
+        let fvk = decode_extended_full_viewing_key(NETWORK.hrp_sapling_extended_full_viewing_key(), &sin.fvk).unwrap().unwrap();
+        let (_, pa) = fvk.default_address();
+        let address = encode_payment_address(NETWORK.hrp_sapling_payment_address(), &pa);
+        assert_eq!(address, "zs1m8d7506t4rpcgaag392xae698gx8j5at63qpg54ssprg6eqej0grmkfu76tq6p495z3w6s8qlll");
+        assert_eq!(pa.to_bytes().len(), 43);
+        buffer.extend_from_slice(&pa.to_bytes());
+        buffer.write_u64::<LE>(sin.amount).unwrap();
+        change += sin.amount as i64;
+    }
+
+    // assert_eq!(buffer.len(), 4+55*s_in_count);
+
+    for sout in tx.outputs.iter() {
+        println!("{} {}", buffer.len(), sout.addr);
+        let pa = decode_payment_address(NETWORK.hrp_sapling_payment_address(), &sout.addr).unwrap().unwrap();
+        assert_eq!(pa.to_bytes().len(), 43);
+        buffer.extend_from_slice(&pa.to_bytes());
+        println!("{}", buffer.len());
+        buffer.write_u64::<LE>(sout.amount).unwrap();
+        println!("{}", buffer.len());
+        buffer.push(0xF6); // no memo
+        println!("{}", buffer.len());
+        buffer.push(0x01); // ovk present
+        buffer.extend_from_slice(&hex::decode(&sout.ovk).unwrap());
+        println!("{}", buffer.len());
+        change -= sout.amount as i64;
+    }
+    assert_eq!(buffer.len(), 4+55*s_in_count+85*(s_out_count));
+
+    change -= i64::from(DEFAULT_FEE);
+    assert!(change >= 0);
+
+    let pa_change = decode_payment_address(NETWORK.hrp_sapling_payment_address(), &tx.change).unwrap().unwrap();
+    buffer.extend_from_slice(&pa_change.to_bytes());
+    buffer.write_u64::<LE>(change as u64).unwrap();
+    buffer.push(0xF6); // no memo
+    buffer.push(0x01); // ovk present
+    buffer.extend_from_slice(&hex::decode(&tx.ovk).unwrap());
+
+    assert_eq!(buffer.len(), 4+55*s_in_count+85*(s_out_count+1));
+    println!("txlen {}", buffer.len());
+
+    let mut chunks: Vec<_> = buffer.chunks(250).collect();
+    chunks.insert(0, &[]); // starts with empty chunk
+    for (index, c) in chunks.iter().enumerate() {
+        let p1 = match index {
+            0 => 0,
+            _ if index == chunks.len() - 1 => 2,
+            _ => 1,
+        };
+        println!("data {}", hex::encode(c));
+        let command = APDUCommand {
+            cla: 0x85,
+            ins: 0xA0,
+            p1,
+            p2: 0,
+            data: c.to_vec(),
+        };
+        let rep = send_request(&command).await;
+        println!("{}", rep.retcode);
+    }
+
+    // get spend data
+    for _ in 0..s_in_count {
+        let command = APDUCommand {
+            cla: 0x85,
+            ins: 0xA1,
+            p1: 0,
+            p2: 0,
+            data: vec![],
+        };
+        let rep = send_request(&command).await;
+        println!("{}", rep.retcode);
+        let ak = &rep.data[0..32];
+        let nsk = &rep.data[32..64];
+        let rcv = &rep.data[64..96];
+        let alpha = &rep.data[96..128];
+        println!("ak {}", hex::encode(ak));
+        println!("nsk {}", hex::encode(nsk));
+        println!("rcv {}", hex::encode(rcv));
+        println!("alpha {}", hex::encode(alpha));
+    }
+}
+
+async fn send_request(command: &APDUCommand) -> APDUAnswer {
+    let port = 9000;
+    let apdu_hex = hex::encode(command.serialize());
+    let client = reqwest::Client::new();
+    let rep = client.post(format!("http://127.0.0.1:{}", port)).json(&APDURequest {
+        apduHex: apdu_hex,
+    }).header("Content-Type", "application/json").send().await.unwrap();
+    let rep: APDUReply = rep.json().await.unwrap();
+    let answer = APDUAnswer::from_answer(hex::decode(rep.data).unwrap());
+    answer
+}
+
+#[cfg(test)]
+mod tests {
+    use std::fs::File;
+    use std::io::Read;
+    use ledger_apdu::*;
+    use crate::{APDUReply, APDURequest, make_tx_init_data, send_request};
+    use crate::tx::Tx;
+
+    #[tokio::test]
+    async fn get_version() {
+        let command = APDUCommand {
+            cla: 0x85,
+            ins: 0x00,
+            p1: 0,
+            p2: 0,
+            data: vec![],
+        };
+        let answer = send_request(&command).await;
+        assert_eq!(answer.retcode, 0x9000);
+        println!("{}.{}", answer.data[1], answer.data[2]);
+        assert_eq!(answer.data[1], 3);
+    }
+
+    #[tokio::test]
+    async fn get_addr() {
+        let command = APDUCommand {
+            cla: 0x85,
+            ins: 0x11,
+            p1: 0,
+            p2: 0,
+            data: vec![0, 0, 0, 0],
+        };
+        let answer = send_request(&command).await;
+        let address = String::from_utf8(answer.data[43..].to_ascii_lowercase()).unwrap();
+        println!("{}", address);
+        assert_eq!(address, "zs1m8d7506t4rpcgaag392xae698gx8j5at63qpg54ssprg6eqej0grmkfu76tq6p495z3w6s8qlll");
+    }
+
+    #[tokio::test]
+    async fn load_tx() {
+        let file = File::open("tx.json").unwrap();
+        let tx: Tx = serde_json::from_reader(&file).unwrap();
+        make_tx_init_data(&tx).await;
+    }
 }
 
